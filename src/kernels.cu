@@ -474,22 +474,54 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
   int max_smem = 0;
   RUNTIME_CHECK(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock, 0));
-  const size_t smem_64 = (2 * 64 * head_dim + 2 * 64 * head_dim + 64 * 64) * sizeof(float);
-  const size_t smem_32 = (2 * 32 * head_dim + 2 * 32 * head_dim + 32 * 32) * sizeof(float);
+  // Paper heuristic: Bc ~= sram_max / (4 * d), Br ~= min(Bc, d).
+  const int ideal_bc = max_smem / (4 * head_dim * static_cast<int>(sizeof(float)));
+  const int ideal_br = (ideal_bc < head_dim) ? ideal_bc : head_dim;
 
-  if (head_dim <= 32 && smem_64 <= static_cast<size_t>(max_smem)) {
+  auto smem_bytes = [head_dim](int B) {
+    return static_cast<size_t>(2 * B * head_dim + 2 * B * head_dim + B * B) * sizeof(float);
+  };
+
+  int chosen = 16;
+  if (ideal_br >= 128 && smem_bytes(128) <= static_cast<size_t>(max_smem)) {
+    chosen = 128;
+  } else if (ideal_br >= 64 && smem_bytes(64) <= static_cast<size_t>(max_smem)) {
+    chosen = 64;
+  } else if (ideal_br >= 32 && smem_bytes(32) <= static_cast<size_t>(max_smem)) {
+    chosen = 32;
+  } else if (smem_bytes(16) <= static_cast<size_t>(max_smem)) {
+    chosen = 16;
+  }
+
+  if (chosen == 128) {
+    constexpr int Br = 128;
+    constexpr int Bc = 128;
+    constexpr int threads_per_block = Br;
+    flash_attention_v2_kernel<T, Br, Bc><<<grid, threads_per_block, smem_bytes(128)>>>(
+        d_q, d_k, d_v, d_o, d_l, d_m,
+        batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim, is_causal);
+  } else if (chosen == 64) {
     constexpr int Br = 64;
     constexpr int Bc = 64;
     constexpr int threads_per_block = Br;
-    flash_attention_v2_kernel<T, Br, Bc><<<grid, threads_per_block, smem_64>>>(
+    flash_attention_v2_kernel<T, Br, Bc><<<grid, threads_per_block, smem_bytes(64)>>>(
+        d_q, d_k, d_v, d_o, d_l, d_m,
+        batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim, is_causal);
+  } else if (chosen == 32) {
+    constexpr int Br = 32;
+    constexpr int Bc = 32;
+    constexpr int threads_per_block = Br;
+    flash_attention_v2_kernel<T, Br, Bc><<<grid, threads_per_block, smem_bytes(32)>>>(
         d_q, d_k, d_v, d_o, d_l, d_m,
         batch_size, target_seq_len, src_seq_len,
         query_heads, kv_heads, head_dim, is_causal);
   } else {
-    constexpr int Br = 32;
-    constexpr int Bc = 32;
+    constexpr int Br = 16;
+    constexpr int Bc = 16;
     constexpr int threads_per_block = Br;
-    flash_attention_v2_kernel<T, Br, Bc><<<grid, threads_per_block, smem_32>>>(
+    flash_attention_v2_kernel<T, Br, Bc><<<grid, threads_per_block, smem_bytes(16)>>>(
         d_q, d_k, d_v, d_o, d_l, d_m,
         batch_size, target_seq_len, src_seq_len,
         query_heads, kv_heads, head_dim, is_causal);
