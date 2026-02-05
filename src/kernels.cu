@@ -6,8 +6,9 @@
 #include <cuda_runtime.h>
 #include "../tester/utils.h"
 
+// v1: block-level reduce, then second-stage reduce on block outputs.
 template <typename T, size_t BS>
-__global__ void trace_kernel(const T *input, T *output, size_t cols, size_t diag_n) {
+__global__ void trace_kernel_v1(const T *input, T *output, size_t cols, size_t diag_n) {
   size_t tid = threadIdx.x;
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   __shared__ T sdata[BS];
@@ -30,7 +31,7 @@ __global__ void trace_kernel(const T *input, T *output, size_t cols, size_t diag
 }
 
 template <typename T, size_t BS>
-__global__ void reduce_kernel(const T *input, T *output, size_t n) {
+__global__ void reduce_kernel_v1(const T *input, T *output, size_t n) {
   size_t tid = threadIdx.x;
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   __shared__ T sdata[BS];
@@ -48,6 +49,56 @@ __global__ void reduce_kernel(const T *input, T *output, size_t n) {
   }
   if (tid == 0) {
     output[blockIdx.x] = sdata[0];
+  }
+}
+
+template <typename T>
+__device__ inline T warp_reduce_sum(T val) {
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+  }
+  return val;
+}
+
+template <typename T>
+__device__ inline void atomic_add(T* addr, T val) {
+  if constexpr (std::is_same<T, int>::value) {
+    atomicAdd(addr, val);
+  } else {
+    atomicAdd(addr, val);
+  }
+}
+
+// v2: grid-stride load + warp shuffle reduction + per-block atomic.
+template <typename T, int BS>
+__global__ void trace_kernel_v2(const T *input, T *output, size_t cols, size_t diag_n) {
+  static_assert(BS % 32 == 0, "BLOCK_SIZE must be multiple of warpSize");
+  __shared__ T warp_sums[32];
+
+  size_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = blockDim.x * gridDim.x;
+
+  T local = 0;
+  for (size_t idx = global_tid; idx < diag_n; idx += stride) {
+    size_t offset = idx * cols + idx;
+    local += input[offset];
+  }
+
+  T val = warp_reduce_sum(local);
+  int lane = threadIdx.x % warpSize;
+  int warp = threadIdx.x / warpSize;
+  if (lane == 0) {
+    warp_sums[warp] = val;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    int warp_count = blockDim.x / warpSize;
+    T block_sum = (lane < warp_count) ? warp_sums[lane] : T(0);
+    block_sum = warp_reduce_sum(block_sum);
+    if (lane == 0) {
+      atomic_add(output, block_sum);
+    }
   }
 }
 
@@ -74,41 +125,55 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
     return T(0);
   }
   const size_t n = min(rows, cols);
-  const size_t total = rows * cols;
   // TODO(step2): allocate device buffers and copy h_input to device.
   T *d_input = nullptr;
   T *d_output = nullptr;
   T h_output = T(0);
   constexpr int threads_per_block = 256;
-  int num_block = (static_cast<int>(n) + threads_per_block -1) / threads_per_block;
-  RUNTIME_CHECK(cudaMalloc(&d_input, total * sizeof(T)));
-  RUNTIME_CHECK(cudaMalloc(&d_output, num_block * sizeof(T)));
-  RUNTIME_CHECK(cudaMemcpy(d_input, h_input.data(), total * sizeof(T) ,cudaMemcpyHostToDevice));
-  RUNTIME_CHECK(cudaMemset(d_output, 0, num_block * sizeof(T)));
-  
-  // TODO(step3): set cuda resource and launch a kernel to sum diagonal elements.
-  trace_kernel<T, threads_per_block><<<num_block, threads_per_block>>>(d_input, d_output, cols, n);
+  int num_block = (static_cast<int>(n) + threads_per_block - 1) / threads_per_block;
+  if (num_block > 1024) {
+    num_block = 1024;
+  }
 
-  size_t cur_n = num_block;
-  T *cur_input = d_output;
-  T *cur_output = nullptr;
-  RUNTIME_CHECK(cudaMalloc(&cur_output, num_block * sizeof(T)));
-  while (cur_n > 1) {
-    num_block = (cur_n + threads_per_block - 1) / threads_per_block;
-    dim3 block(threads_per_block);
-    dim3 grid(num_block);
-    reduce_kernel<T, threads_per_block><<<grid, block>>>(cur_input, cur_output, cur_n);
+  RUNTIME_CHECK(cudaMalloc(&d_input, h_input.size() * sizeof(T)));
+  RUNTIME_CHECK(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(T), cudaMemcpyHostToDevice));
+
+  // Toggle between implementations.
+  constexpr bool use_trace_v2 = true;
+
+  if constexpr (!use_trace_v2) {
+    RUNTIME_CHECK(cudaMalloc(&d_output, num_block * sizeof(T)));
+    RUNTIME_CHECK(cudaMemset(d_output, 0, num_block * sizeof(T)));
+    trace_kernel_v1<T, threads_per_block><<<num_block, threads_per_block>>>(d_input, d_output, cols, n);
+    size_t cur_n = num_block;
+    T *cur_input = d_output;
+    T *cur_output = nullptr;
+    RUNTIME_CHECK(cudaMalloc(&cur_output, num_block * sizeof(T)));
+    while (cur_n > 1) {
+      num_block = (cur_n + threads_per_block - 1) / threads_per_block;
+      dim3 block(threads_per_block);
+      dim3 grid(num_block);
+      reduce_kernel_v1<T, threads_per_block><<<grid, block>>>(cur_input, cur_output, cur_n);
+      RUNTIME_CHECK(cudaGetLastError());
+      RUNTIME_CHECK(cudaDeviceSynchronize());
+      cur_n = num_block;
+      cur_input = cur_output;
+    }
+    RUNTIME_CHECK(cudaMemcpy(&h_output, cur_input, sizeof(T), cudaMemcpyDeviceToHost));
+    RUNTIME_CHECK(cudaFree(cur_output));
+    RUNTIME_CHECK(cudaFree(d_output));
+  } else {
+    RUNTIME_CHECK(cudaMalloc(&d_output, sizeof(T)));
+    RUNTIME_CHECK(cudaMemset(d_output, 0, sizeof(T)));
+    trace_kernel_v2<T, threads_per_block><<<num_block, threads_per_block>>>(d_input, d_output, cols, n);
     RUNTIME_CHECK(cudaGetLastError());
     RUNTIME_CHECK(cudaDeviceSynchronize());
-    cur_n = num_block;
-    cur_input = cur_output;
+    RUNTIME_CHECK(cudaMemcpy(&h_output, d_output, sizeof(T), cudaMemcpyDeviceToHost));
+    RUNTIME_CHECK(cudaFree(d_output));
   }
-  
+
   // TODO(step4): copy result back and free buffers.
-  RUNTIME_CHECK(cudaMemcpy(&h_output, cur_input, sizeof(T), cudaMemcpyDeviceToHost));
   RUNTIME_CHECK(cudaFree(d_input));
-  RUNTIME_CHECK(cudaFree(d_output));
-  RUNTIME_CHECK(cudaFree(cur_output));
   return h_output;
 }
 
@@ -142,6 +207,7 @@ inline float host_to_float(T v) {
   }
 }
 
+// v1: tiled attention with online softmax (m/l) accumulation.
 template <typename T, int Br, int Bc>
 __global__ void flash_attention_v1_kernel(const T* q, const T* k, const T* v, T* o,
                                           float* l, float* m,
@@ -156,7 +222,7 @@ __global__ void flash_attention_v1_kernel(const T* q, const T* k, const T* v, T*
   }
 
   int num_group = q_heads / kv_heads;
-  int kvh = (num_group > 0) ? (qh / num_group) : 0;
+  int kvh = (num_group > 0) ? (qh / num_group) : 0;  // GQA: map query head to kv head
   const float scale = rsqrtf(static_cast<float>(d));
 
   // shared layout: Qi[Br*D], Kj[Bc*D], Vj[Bc*D], S[Br*Bc]
@@ -169,6 +235,7 @@ __global__ void flash_attention_v1_kernel(const T* q, const T* k, const T* v, T*
   int Tc = (src_len + Bc - 1) / Bc;
   int Tr = (tgt_len + Br - 1) / Br;
 
+  // Iterate KV tiles.
   for (int j = 0; j < Tc; ++j) {
     int s = j * Bc + tid;
     if (tid < Bc) {
@@ -191,6 +258,7 @@ __global__ void flash_attention_v1_kernel(const T* q, const T* k, const T* v, T*
     }
     __syncthreads();
 
+    // Iterate Q tiles.
     for (int i = 0; i < Tr; ++i) {
       int t = i * Br + tid;
       if (tid < Br) {
@@ -271,6 +339,7 @@ __global__ void flash_attention_v1_kernel(const T* q, const T* k, const T* v, T*
   }
 }
 
+// v2: block-tiled attention with O tile residency and online softmax.
 template <typename T, int Br, int Bc>
 __global__ void flash_attention_v2_kernel(const T* q, const T* k, const T* v, T* o,
                                           float* l, float* m,
@@ -286,7 +355,7 @@ __global__ void flash_attention_v2_kernel(const T* q, const T* k, const T* v, T*
   }
 
   int num_group = q_heads / kv_heads;
-  int kvh = (num_group > 0) ? (qh / num_group) : 0;
+  int kvh = (num_group > 0) ? (qh / num_group) : 0;  // GQA: map query head to kv head
   const float scale = rsqrtf(static_cast<float>(d));
 
   // shared layout: Qi[Br*D], Oi[Br*D], Kj[Bc*D], Vj[Bc*D], S[Br*Bc]
@@ -300,6 +369,7 @@ __global__ void flash_attention_v2_kernel(const T* q, const T* k, const T* v, T*
   int Tc = (src_len + Bc - 1) / Bc;
   int Tr = (tgt_len + Br - 1) / Br;
 
+  // Iterate Q tiles (Oi stays in shared memory across KV tiles).
   for (int i = 0; i < Tr; ++i) {
     int t = i * Br + tid;
     if (tid < Br) {
@@ -325,6 +395,7 @@ __global__ void flash_attention_v2_kernel(const T* q, const T* k, const T* v, T*
       row_l_prev = l[lm_base];
     }
 
+    // Iterate KV tiles.
     for (int j = 0; j < Tc; ++j) {
       int s = j * Bc + tid;
       if (tid < Bc) {
@@ -493,6 +564,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     chosen = 16;
   }
 
+  // Choose the largest supported tile to maximize reuse.
   if (chosen == 128) {
     constexpr int Br = 128;
     constexpr int Bc = 128;
